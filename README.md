@@ -3,7 +3,7 @@ A simple Go logging library.
 ## Install
 
 ```bash
-go get github.com/rannday/golog@v0.1.0
+go get github.com/rannday/golog@v0.1.1
 ```
 ## Usage
 ```go
