@@ -144,6 +144,29 @@ func TestTransportLogger_RequestBodyRedaction(t *testing.T) {
 	if !(strings.Contains(out, "password") && strings.Contains(out, "REDACTED")) {
 		t.Fatalf("expected password to be redacted in logs, got: %s", out)
 	}
+	if strings.Contains(out, "secret") {
+		t.Fatalf("expected cleartext secret to be removed, got: %s", out)
+	}
+}
+
+func TestRedactJSON_NestedAndCaseInsensitive(t *testing.T) {
+	in := []byte(`{"Password":"secret","nested":{"token":"abc"},"items":[{"ApiKey":"k"},{"x":1}]}`)
+	out := string(redactJSON(in, []string{"password", "token", "apikey"}))
+
+	if strings.Contains(out, "secret") || strings.Contains(out, "abc") || strings.Contains(out, `"k"`) {
+		t.Fatalf("expected nested secrets to be redacted, got: %s", out)
+	}
+	if strings.Count(out, "REDACTED") != 3 {
+		t.Fatalf("expected exactly 3 redacted fields, got: %s", out)
+	}
+}
+
+func TestRedactJSON_InvalidJSONFallback(t *testing.T) {
+	in := []byte(`{"password":"secret"`)
+	out := redactJSON(in, []string{"password"})
+	if string(out) != string(in) {
+		t.Fatalf("expected invalid JSON to be returned unchanged")
+	}
 }
 
 func TestTransportLogger_SkipsLargeRequestAndResponse(t *testing.T) {

@@ -1,0 +1,12 @@
+model = "gpt-5.2"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+web_search = "cached"
+model_reasoning_effort = "high"
+personality = "pragmatic"
+
+[shell_environment_policy]
+include_only = ["PATH"]
+
+[features]
+shell_snapshot = true

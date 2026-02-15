@@ -23,7 +23,7 @@ import (
 )
 
 func main() {
-    logx.Init(logx.Config{
+    logx.Configure(logx.Config{
         Level:           slog.LevelInfo,
         Console:         true,
         AddSource:       false,
@@ -37,7 +37,7 @@ func main() {
 ```
 ## Configuration
 ``` go
-logx.Init(logx.Config{
+logx.Configure(logx.Config{
     Level:           slog.LevelDebug,
     Console:         true,
     FilePath:        "app.log",
@@ -46,6 +46,32 @@ logx.Init(logx.Config{
     StacktraceLevel: slog.LevelError,
 })
 ```
+## Bootstrap Then Configure
+Use `Configure` for early console logging, then call `Configure` again after app config/env is loaded.
+``` go
+// bootstrap: console only
+if err := logx.Configure(logx.Config{
+    Level:   slog.LevelInfo,
+    Console: true,
+}); err != nil {
+    panic(err)
+}
+
+// ...load env/config...
+
+// configure again: attach file output after config is known
+if err := logx.Configure(logx.Config{
+    Level:           slog.LevelDebug,
+    Console:         true,
+    FilePath:        "app.log",
+    JSONFile:        false,
+    AddSource:       true,
+    StacktraceLevel: slog.LevelError,
+}); err != nil {
+    panic(err)
+}
+```
+Calling `Configure` again is the supported way to attach file logging after startup.
 ## Runtime Level Changes
 ``` go
 logx.SetLevel(slog.LevelDebug)
@@ -116,11 +142,6 @@ defer done()
 logx.Fatal("unrecoverable error")
 ```
 Logs at error level and exits with status code `1`.
-## Examples
-``` bash
-go run ./examples/text
-go run ./examples/json
-```
 ## Testing
 ``` bash
 go test -race ./...

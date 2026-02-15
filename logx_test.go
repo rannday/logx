@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,7 +30,7 @@ func capture(t *testing.T, level slog.Level, fn func()) string {
 		AddSource: false,
 	})
 
-	// Match Init() decorator chain
+	// Match Configure() decorator chain
 	handler := newStackHandler(base, 0)
 	handler = newRedactionHandler(handler)
 
@@ -153,11 +155,11 @@ func TestSetLevel_RuntimeChange(t *testing.T) {
 // ---- Hardened Init Test ----
 //
 
-func TestInit_FileFailureFallback(t *testing.T) {
+func TestConfigure_FileFailureFallback(t *testing.T) {
 	Reset()
 
 	// Force console off and invalid file path
-	err := Init(Config{
+	err := Configure(Config{
 		Level:    slog.LevelInfo,
 		Console:  false,
 		FilePath: "/invalid/path/should/fail.log",
@@ -299,12 +301,12 @@ func TestTimedWith_LogsStartAndComplete(t *testing.T) {
 	}
 }
 
-func TestInit_UsesFileWriter(t *testing.T) {
+func TestConfigure_UsesFileWriter(t *testing.T) {
 	Reset()
 	var buf nopWriteCloser
 	buf.Buffer = &bytes.Buffer{}
 
-	err := Init(Config{
+	err := Configure(Config{
 		Level:      slog.LevelInfo,
 		Console:    false,
 		FileWriter: buf,
@@ -316,6 +318,152 @@ func TestInit_UsesFileWriter(t *testing.T) {
 	Logger().Info("hello", "k", "v")
 	if buf.Len() == 0 {
 		t.Fatalf("expected logs written to FileWriter")
+	}
+}
+
+func TestConfigure_ChangesLevelAndOutputTargets(t *testing.T) {
+	Reset()
+	defer Reset()
+
+	dir := t.TempDir()
+	file1 := filepath.Join(dir, "first.log")
+	file2 := filepath.Join(dir, "second.log")
+
+	err := Configure(Config{
+		Level:    slog.LevelInfo,
+		Console:  false,
+		FilePath: file1,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	Debug("debug-before")
+	Info("info-before")
+
+	err = Configure(Config{
+		Level:    slog.LevelDebug,
+		Console:  false,
+		FilePath: file2,
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure failed: %v", err)
+	}
+
+	Debug("debug-after")
+	Info("info-after")
+
+	b1, err := os.ReadFile(file1)
+	if err != nil {
+		t.Fatalf("read first file: %v", err)
+	}
+	out1 := string(b1)
+	if strings.Contains(out1, "debug-before") {
+		t.Fatalf("expected debug-before to be filtered at info level")
+	}
+	assertContains(t, out1, "info-before")
+	if strings.Contains(out1, "debug-after") || strings.Contains(out1, "info-after") {
+		t.Fatalf("expected reconfigured logs not to be written to first target")
+	}
+
+	b2, err := os.ReadFile(file2)
+	if err != nil {
+		t.Fatalf("read second file: %v", err)
+	}
+	out2 := string(b2)
+	assertContains(t, out2, "debug-after")
+	assertContains(t, out2, "info-after")
+}
+
+func TestConfigure_ClosesPreviousFileWriter(t *testing.T) {
+	Reset()
+	defer Reset()
+
+	w1 := &trackingWriteCloser{}
+	err := Configure(Config{
+		Level:      slog.LevelInfo,
+		Console:    false,
+		FileWriter: w1,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	Info("first")
+
+	w2 := &trackingWriteCloser{}
+	err = Configure(Config{
+		Level:      slog.LevelInfo,
+		Console:    false,
+		FileWriter: w2,
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure failed: %v", err)
+	}
+
+	if got := w1.CloseCount(); got != 1 {
+		t.Fatalf("expected previous writer to be closed once, got %d", got)
+	}
+
+	Info("second")
+
+	if strings.Contains(w1.String(), "second") {
+		t.Fatalf("expected second log not to be written to previous writer")
+	}
+	assertContains(t, w2.String(), "second")
+}
+
+func TestConfigureTwice_NoPanic(t *testing.T) {
+	Reset()
+	defer Reset()
+
+	if err := Configure(Config{
+		Level:   slog.LevelInfo,
+		Console: true,
+	}); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	file := filepath.Join(t.TempDir(), "app.log")
+	if err := Configure(Config{
+		Level:    slog.LevelInfo,
+		Console:  false,
+		FilePath: file,
+	}); err != nil {
+		t.Fatalf("Reconfigure failed: %v", err)
+	}
+
+	Info("still-running")
+}
+
+func TestReset_ClearsStateAndClosesWriter(t *testing.T) {
+	Reset()
+	defer Reset()
+
+	w := &trackingWriteCloser{}
+	if err := Configure(Config{
+		Level:      slog.LevelInfo,
+		Console:    false,
+		FileWriter: w,
+	}); err != nil {
+		t.Fatalf("Reconfigure failed: %v", err)
+	}
+
+	Info("before-reset")
+	Reset()
+
+	if got := w.CloseCount(); got != 1 {
+		t.Fatalf("expected writer close once on reset, got %d", got)
+	}
+	if logger != nil {
+		t.Fatalf("expected logger to be nil after reset")
+	}
+	if currentCloser != nil {
+		t.Fatalf("expected currentCloser to be nil after reset")
+	}
+	Info("after-reset")
+	if strings.Contains(w.String(), "after-reset") {
+		t.Fatalf("expected old writer to be detached after reset")
 	}
 }
 
@@ -367,6 +515,42 @@ func TestColorWriter_ReplacesLevelColor(t *testing.T) {
 type nopWriteCloser struct{ *bytes.Buffer }
 
 func (n nopWriteCloser) Close() error { return nil }
+
+type trackingWriteCloser struct {
+	mu         sync.Mutex
+	buf        bytes.Buffer
+	closed     bool
+	closeCount int
+}
+
+func (t *trackingWriteCloser) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return 0, errors.New("writer is closed")
+	}
+	return t.buf.Write(p)
+}
+
+func (t *trackingWriteCloser) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	t.closeCount++
+	return nil
+}
+
+func (t *trackingWriteCloser) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.buf.String()
+}
+
+func (t *trackingWriteCloser) CloseCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closeCount
+}
 
 type testHandler struct{ enabled bool }
 

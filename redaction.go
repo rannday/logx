@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 )
 
+// SanitizeURL returns a redacted URL string with sensitive query parameters masked.
 func SanitizeURL(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -39,6 +40,8 @@ func init() {
 	redactedKeysSnapshot.Store(map[string]struct{}{})
 }
 
+// SetRedactedKeys adds keys to the global redaction set.
+// Keys are normalized to lowercase.
 func SetRedactedKeys(keys ...string) {
 	redactedKeysMu.Lock()
 	defer redactedKeysMu.Unlock()

@@ -13,14 +13,14 @@ func TestStacktraceLevel_AddsStack(t *testing.T) {
 	var buf bytes.Buffer
 	useColor = false
 
-	err := Init(Config{
+	err := Configure(Config{
 		Level:           slog.LevelInfo,
 		Console:         false,
 		StacktraceLevel: slog.LevelError,
 	})
 
 	if err != nil {
-		t.Fatalf("unexpected init error: %v", err)
+		t.Fatalf("unexpected configure error: %v", err)
 	}
 
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{

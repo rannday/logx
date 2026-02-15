@@ -6,11 +6,11 @@ package httpx
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -52,18 +52,55 @@ func (t *TransportLogger) EnableBodyLogging(maxBytes int) *TransportLogger {
 }
 
 func redactJSON(b []byte, redactedKeys []string) []byte {
-	s := string(b)
-	for _, k := range redactedKeys {
-		re := regexp.MustCompile(`(?i)"` + regexp.QuoteMeta(k) + `"\s*:\s*"([^"]*)"`)
-		s = re.ReplaceAllString(s, `"`+k+`":"REDACTED"`)
+	if len(redactedKeys) == 0 || len(b) == 0 {
+		return b
 	}
-	return []byte(s)
+
+	keySet := make(map[string]struct{}, len(redactedKeys))
+	for _, k := range redactedKeys {
+		keySet[strings.ToLower(k)] = struct{}{}
+	}
+
+	var payload any
+	if err := json.Unmarshal(b, &payload); err != nil {
+		// Invalid JSON: return original bytes instead of risking broken masking.
+		return b
+	}
+
+	redactJSONValue(payload, keySet)
+
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return b
+	}
+	return out
+}
+
+func redactJSONValue(v any, keySet map[string]struct{}) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, child := range x {
+			if _, ok := keySet[strings.ToLower(k)]; ok {
+				x[k] = "REDACTED"
+				continue
+			}
+			redactJSONValue(child, keySet)
+		}
+	case []any:
+		for _, child := range x {
+			redactJSONValue(child, keySet)
+		}
+	}
 }
 
 func redactForm(s string, redactedKeys []string) string {
 	vals, _ := url.ParseQuery(s)
+	keySet := make(map[string]struct{}, len(redactedKeys))
 	for _, k := range redactedKeys {
-		if _, ok := vals[k]; ok {
+		keySet[strings.ToLower(k)] = struct{}{}
+	}
+	for k := range vals {
+		if _, ok := keySet[strings.ToLower(k)]; ok {
 			vals.Set(k, "REDACTED")
 		}
 	}

@@ -14,10 +14,11 @@ import (
 )
 
 var (
-	logger   *slog.Logger
-	levelVar = new(slog.LevelVar)
-	once     sync.Once
-	useColor bool
+	logger        *slog.Logger
+	levelVar      = new(slog.LevelVar)
+	useColor      bool
+	loggerMu      sync.RWMutex
+	currentCloser io.Closer
 )
 
 const (
@@ -28,12 +29,19 @@ const (
 	colorGray   = "\033[90m"
 )
 
+// Config controls logger construction for Configure.
 type Config struct {
-	Level           slog.Level
-	Console         bool
-	FilePath        string
-	JSONFile        bool
-	AddSource       bool
+	// Level is the minimum enabled log level.
+	Level slog.Level
+	// Console enables console logging to stderr.
+	Console bool
+	// FilePath enables file logging to this path when FileWriter is nil.
+	FilePath string
+	// JSONFile enables JSON output for file logs (text otherwise).
+	JSONFile bool
+	// AddSource enables source file/line annotation in records.
+	AddSource bool
+	// StacktraceLevel appends stack traces for records at/above this level.
 	StacktraceLevel slog.Level
 	// File rotation settings
 	FileMaxSizeBytes int // rotate when file exceeds this many bytes (0 = disabled)
@@ -44,156 +52,194 @@ type Config struct {
 	FileWriter io.WriteCloser
 }
 
-// Init initializes the global logger according to the provided Config.
-// It is safe to call multiple times; initialization is performed once.
-func Init(cfg Config) error {
-	var initErr error
+// Configure rebuilds logger handlers and installs the new global logger.
+// Calling Configure again replaces the current handlers and closes any
+// previously configured file-backed writer after the swap.
+func Configure(cfg Config) error {
+	nextLogger, nextCloser, err := buildLogger(cfg)
 
-	once.Do(func() {
-		levelVar.Set(cfg.Level)
+	loggerMu.Lock()
+	prevCloser := currentCloser
+	levelVar.Set(cfg.Level)
+	logger = nextLogger
+	currentCloser = nextCloser
+	slog.SetDefault(nextLogger)
+	loggerMu.Unlock()
 
-		opts := &slog.HandlerOptions{
-			Level:     levelVar,
-			AddSource: cfg.AddSource,
+	if prevCloser != nil {
+		_ = prevCloser.Close()
+	}
+
+	return err
+}
+
+func buildLogger(cfg Config) (*slog.Logger, io.Closer, error) {
+	opts := &slog.HandlerOptions{
+		Level:     levelVar,
+		AddSource: cfg.AddSource,
+	}
+
+	var handlers []slog.Handler
+
+	if cfg.Console {
+		colorEnabled := detectColor()
+		useColor = colorEnabled
+
+		var writer io.Writer = os.Stderr
+		if colorEnabled {
+			writer = &colorWriter{w: os.Stderr}
 		}
 
-		var handlers []slog.Handler
-
-		if cfg.Console {
-			useColor = detectColor()
-
-			var writer io.Writer = os.Stderr
-			if useColor {
-				writer = &colorWriter{w: os.Stderr}
-			}
-
-			if cfg.ConsoleJSON {
-				handlers = append(handlers,
-					slog.NewJSONHandler(writer, opts),
-				)
-			} else {
-				handlers = append(handlers,
-					slog.NewTextHandler(writer, opts),
-				)
-			}
-		}
-
-		var fileWriter io.WriteCloser
-		if cfg.FileWriter != nil {
-			fileWriter = cfg.FileWriter
-		} else if cfg.FilePath != "" {
-			if cfg.FileMaxSizeBytes > 0 {
-				r, err := newFileRotator(cfg.FilePath, cfg.FileMaxSizeBytes, cfg.FileMaxBackups)
-				if err != nil {
-					initErr = err
-				} else {
-					fileWriter = r
-				}
-			} else {
-				f, err := os.OpenFile(
-					cfg.FilePath,
-					os.O_CREATE|os.O_APPEND|os.O_WRONLY,
-					0o644,
-				)
-				if err != nil {
-					initErr = err
-				} else {
-					fileWriter = f
-				}
-			}
-		}
-
-		if fileWriter != nil {
-			if cfg.JSONFile {
-				handlers = append(handlers,
-					slog.NewJSONHandler(fileWriter, opts),
-				)
-			} else {
-				handlers = append(handlers,
-					slog.NewTextHandler(fileWriter, opts),
-				)
-			}
-		}
-
-		if len(handlers) == 0 {
-			handlers = append(handlers,
-				slog.NewTextHandler(os.Stderr, opts),
-			)
-		}
-
-		var handler slog.Handler
-		if len(handlers) == 1 {
-			handler = handlers[0]
+		if cfg.ConsoleJSON {
+			handlers = append(handlers, slog.NewJSONHandler(writer, opts))
 		} else {
-			handler = newMultiHandler(handlers...)
+			handlers = append(handlers, slog.NewTextHandler(writer, opts))
 		}
+	}
 
-		handler = newStackHandler(handler, cfg.StacktraceLevel)
-		handler = newRedactionHandler(handler)
+	var fileWriter io.WriteCloser
+	var buildErr error
+	if cfg.FileWriter != nil {
+		fileWriter = cfg.FileWriter
+	} else if cfg.FilePath != "" {
+		if cfg.FileMaxSizeBytes > 0 {
+			r, err := newFileRotator(cfg.FilePath, cfg.FileMaxSizeBytes, cfg.FileMaxBackups)
+			if err != nil {
+				buildErr = err
+			}
+			if r != nil {
+				fileWriter = r
+			}
+		} else {
+			f, err := os.OpenFile(
+				cfg.FilePath,
+				os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+				0o644,
+			)
+			if err != nil {
+				buildErr = err
+			}
+			if f != nil {
+				fileWriter = f
+			}
+		}
+	}
 
-		logger = slog.New(handler)
-		slog.SetDefault(logger)
-	})
+	if fileWriter != nil {
+		if cfg.JSONFile {
+			handlers = append(handlers, slog.NewJSONHandler(fileWriter, opts))
+		} else {
+			handlers = append(handlers, slog.NewTextHandler(fileWriter, opts))
+		}
+	}
 
-	return initErr
+	if len(handlers) == 0 {
+		handlers = append(handlers, slog.NewTextHandler(os.Stderr, opts))
+	}
+
+	var handler slog.Handler
+	if len(handlers) == 1 {
+		handler = handlers[0]
+	} else {
+		handler = newMultiHandler(handlers...)
+	}
+
+	handler = newStackHandler(handler, cfg.StacktraceLevel)
+	handler = newRedactionHandler(handler)
+
+	return slog.New(handler), fileWriter, buildErr
 }
 
 // Reset clears logger state.
 // Intended for testing only.
 func Reset() {
+	loggerMu.Lock()
+	prevCloser := currentCloser
 	logger = nil
+	currentCloser = nil
 	useColor = false
 	levelVar = new(slog.LevelVar)
-	once = sync.Once{}
-	redactedKeys = map[string]struct{}{}
+	loggerMu.Unlock()
+	ClearRedactedKeys()
+
+	if prevCloser != nil {
+		_ = prevCloser.Close()
+	}
 }
 
 // SetLogger replaces the global logger.
 // Intended for testing only.
 func SetLogger(l *slog.Logger) {
+	loggerMu.Lock()
+	prevCloser := currentCloser
 	logger = l
+	currentCloser = nil
 	slog.SetDefault(l)
+	loggerMu.Unlock()
+	if prevCloser != nil {
+		_ = prevCloser.Close()
+	}
 }
 
+// SetLevel updates the global minimum log level at runtime.
 func SetLevel(level slog.Level) {
 	levelVar.Set(level)
 }
 
+// Logger returns the package logger.
+// If no logger has been configured yet, it initializes a default
+// console logger at info level.
 func Logger() *slog.Logger {
-	if logger == nil {
-		_ = Init(Config{
+	loggerMu.RLock()
+	l := logger
+	loggerMu.RUnlock()
+
+	if l == nil {
+		_ = Configure(Config{
 			Level:   slog.LevelInfo,
 			Console: true,
 		})
+
+		loggerMu.RLock()
+		l = logger
+		loggerMu.RUnlock()
 	}
-	return logger
+	return l
 }
 
+// Debug logs a message at debug level.
 func Debug(msg string, args ...any) {
 	Logger().Debug(msg, args...)
 }
 
+// Info logs a message at info level.
 func Info(msg string, args ...any) {
 	Logger().Info(msg, args...)
 }
 
+// Warn logs a message at warn level.
 func Warn(msg string, args ...any) {
 	Logger().Warn(msg, args...)
 }
 
+// Error logs a message at error level.
 func Error(msg string, args ...any) {
 	Logger().Error(msg, args...)
 }
 
+// Fatal logs a message at error level and exits the process with status 1.
 func Fatal(msg string, args ...any) {
 	Logger().Error(msg, args...)
 	os.Exit(1)
 }
 
+// Loggable can be implemented by custom errors to emit extra structured fields.
 type Loggable interface {
 	LogAttrs() []slog.Attr
 }
 
+// ErrorErr logs an error with normalized fields:
+// "error", "error_type", and optional Loggable attributes.
 func ErrorErr(msg string, err error, args ...any) {
 	if err == nil {
 		Logger().Error(msg, args...)
@@ -217,22 +263,27 @@ func ErrorErr(msg string, err error, args ...any) {
 	Logger().Error(msg, fields...)
 }
 
+// DebugContext logs a debug message with context.
 func DebugContext(ctx context.Context, msg string, args ...any) {
 	Logger().DebugContext(ctx, msg, args...)
 }
 
+// InfoContext logs an info message with context.
 func InfoContext(ctx context.Context, msg string, args ...any) {
 	Logger().InfoContext(ctx, msg, args...)
 }
 
+// WarnContext logs a warn message with context.
 func WarnContext(ctx context.Context, msg string, args ...any) {
 	Logger().WarnContext(ctx, msg, args...)
 }
 
+// ErrorContext logs an error message with context.
 func ErrorContext(ctx context.Context, msg string, args ...any) {
 	Logger().ErrorContext(ctx, msg, args...)
 }
 
+// ErrorErrContext is the context-aware variant of ErrorErr.
 func ErrorErrContext(ctx context.Context, msg string, err error, args ...any) {
 	if err == nil {
 		Logger().ErrorContext(ctx, msg, args...)
@@ -255,10 +306,12 @@ func ErrorErrContext(ctx context.Context, msg string, err error, args ...any) {
 	Logger().ErrorContext(ctx, msg, fields...)
 }
 
+// With returns a child logger with additional structured attributes.
 func With(args ...any) *slog.Logger {
 	return Logger().With(args...)
 }
 
+// WithGroup returns a child logger that scopes subsequent fields under name.
 func WithGroup(name string) *slog.Logger {
 	return Logger().WithGroup(name)
 }
@@ -331,6 +384,8 @@ func TimedWith(l *slog.Logger, ctx context.Context, msg string, args ...any) fun
 	}
 }
 
+// TimedLevel logs "<msg> started" and returns a closure that logs
+// "<msg> completed" with elapsed duration at the provided level.
 func TimedLevel(
 	l *slog.Logger,
 	level slog.Level,
