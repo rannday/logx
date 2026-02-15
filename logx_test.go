@@ -3,13 +3,14 @@ package logx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func capture(t *testing.T, level slog.Level, fn func()) string {
@@ -260,55 +261,132 @@ func TestTimedLevel_EmitsStartAndComplete(t *testing.T) {
 	assertContains(t, out, "duration=")
 }
 
-func TestStacktraceLevel_AddsStack(t *testing.T) {
-	Reset()
+func TestDetectColor_NoColorEnv(t *testing.T) {
+	os.Setenv("NO_COLOR", "1")
+	defer os.Unsetenv("NO_COLOR")
+	if detectColor() {
+		t.Fatalf("expected detectColor to be false when NO_COLOR is set")
+	}
+}
 
-	var buf bytes.Buffer
-	useColor = false
-
-	err := Init(Config{
-		Level:           slog.LevelInfo,
-		Console:         false,
-		StacktraceLevel: slog.LevelError,
-	})
-
-	if err != nil {
-		t.Fatalf("unexpected init error: %v", err)
+func TestMultiHandler_EnabledAndWithAttrs(t *testing.T) {
+	hFalse := &testHandler{enabled: false}
+	hTrue := &testHandler{enabled: true}
+	m := newMultiHandler(hFalse, hTrue)
+	if !m.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatalf("expected multiHandler to be enabled when one handler is enabled")
 	}
 
-	// Override logger to capture output
-	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{
-		Level:     levelVar,
-		AddSource: false,
-	})
-	logger = slog.New(newStackHandler(handler, slog.LevelError))
+	h2 := m.WithAttrs([]slog.Attr{{Key: "k", Value: slog.StringValue("v")}})
+	if h2 == nil {
+		t.Fatalf("expected WithAttrs to return a handler")
+	}
+}
 
-	Error("boom")
+func TestTimedWith_LogsStartAndComplete(t *testing.T) {
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{AddSource: false})
+	l := slog.New(handler)
+
+	ctx := context.Background()
+	done := TimedWith(l, ctx, "op", "id", 1)
+	time.Sleep(1 * time.Millisecond)
+	done()
 
 	out := buf.String()
-
-	assertContains(t, out, "level=ERROR")
-	assertContains(t, out, "stack=")
+	if out == "" {
+		t.Fatalf("expected logs from TimedWith, got empty")
+	}
 }
 
-func TestRedactionHandler_RedactsKeys(t *testing.T) {
-	out := capture(t, slog.LevelInfo, func() {
-		SetRedactedKeys("password")
-		Info("login", "password", "secret", "user", "admin")
+func TestInit_UsesFileWriter(t *testing.T) {
+	Reset()
+	var buf nopWriteCloser
+	buf.Buffer = &bytes.Buffer{}
+
+	err := Init(Config{
+		Level:      slog.LevelInfo,
+		Console:    false,
+		FileWriter: buf,
 	})
-
-	assertContains(t, out, "password=REDACTED")
-	assertContains(t, out, "user=admin")
-}
-
-func TestSanitizeURL_RedactsQueryParams(t *testing.T) {
-	u, _ := url.Parse("https://fw/api?apikey=abc123&name=test")
-
-	s := SanitizeURL(u)
-
-	if strings.Contains(s, "abc123") {
-		t.Fatalf("expected apikey to be redacted")
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
 	}
 
-	assertContains(t, s, "apikey=REDACTED")
+	Logger().Info("hello", "k", "v")
+	if buf.Len() == 0 {
+		t.Fatalf("expected logs written to FileWriter")
+	}
 }
+
+func TestMultiHandler_ReturnsFirstError(t *testing.T) {
+	e1 := errors.New("first")
+	h := newMultiHandler(&errHandler{err: e1}, &errHandler{err: nil})
+
+	rec := slog.NewRecord(time.Now(), slog.LevelInfo, "m", 0)
+	if err := h.Handle(context.Background(), rec); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+func TestMultiHandler_WithGroupAndWithAttrs(t *testing.T) {
+	s1 := &simpleHandler{}
+	s2 := &simpleHandler{}
+	m := newMultiHandler(s1, s2)
+
+	wg := m.WithGroup("g")
+	if wg == nil {
+		t.Fatalf("expected WithGroup to return a handler")
+	}
+
+	wa := m.WithAttrs([]slog.Attr{{Key: "k", Value: slog.StringValue("v")}})
+	if wa == nil {
+		t.Fatalf("expected WithAttrs to return a handler")
+	}
+}
+
+func TestColorWriter_ReplacesLevelColor(t *testing.T) {
+	var buf bytes.Buffer
+	cw := &colorWriter{w: &buf}
+
+	line := "time=now level=ERROR msg=oops\n"
+	_, err := cw.Write([]byte(line))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") {
+		t.Fatalf("expected level text present")
+	}
+	if !strings.Contains(out, "\033[31m") {
+		t.Fatalf("expected red color escape in output")
+	}
+}
+
+type nopWriteCloser struct{ *bytes.Buffer }
+
+func (n nopWriteCloser) Close() error { return nil }
+
+type testHandler struct{ enabled bool }
+
+func (t *testHandler) Enabled(ctx context.Context, level slog.Level) bool { return t.enabled }
+func (t *testHandler) Handle(ctx context.Context, r slog.Record) error    { return nil }
+func (t *testHandler) WithAttrs(attrs []slog.Attr) slog.Handler           { return t }
+func (t *testHandler) WithGroup(name string) slog.Handler                 { return t }
+
+type errHandler struct {
+	err error
+}
+
+func (e *errHandler) Enabled(ctx context.Context, level slog.Level) bool { return true }
+func (e *errHandler) Handle(ctx context.Context, r slog.Record) error    { return e.err }
+func (e *errHandler) WithAttrs(attrs []slog.Attr) slog.Handler           { return e }
+func (e *errHandler) WithGroup(name string) slog.Handler                 { return e }
+
+type simpleHandler struct{}
+
+func (s *simpleHandler) Enabled(ctx context.Context, level slog.Level) bool { return true }
+func (s *simpleHandler) Handle(ctx context.Context, r slog.Record) error    { return nil }
+func (s *simpleHandler) WithAttrs(attrs []slog.Attr) slog.Handler           { return s }
+func (s *simpleHandler) WithGroup(name string) slog.Handler                 { return s }

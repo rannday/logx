@@ -1,13 +1,14 @@
+// Package logx provides a simple wrapper around slog with some additional features:
 package logx
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 )
@@ -34,14 +35,17 @@ type Config struct {
 	JSONFile        bool
 	AddSource       bool
 	StacktraceLevel slog.Level
+	// File rotation settings
+	FileMaxSizeBytes int // rotate when file exceeds this many bytes (0 = disabled)
+	FileMaxBackups   int // number of rotated files to keep
+	// ConsoleJSON outputs console logs as JSON when true
+	ConsoleJSON bool
+	// FileWriter can be provided to control file output (overrides FilePath)
+	FileWriter io.WriteCloser
 }
 
-//
-// ------------------------------------------------
-// Initialization
-// ------------------------------------------------
-//
-
+// Init initializes the global logger according to the provided Config.
+// It is safe to call multiple times; initialization is performed once.
 func Init(cfg Config) error {
 	var initErr error
 
@@ -55,9 +59,6 @@ func Init(cfg Config) error {
 
 		var handlers []slog.Handler
 
-		// -----------------------
-		// Console handler
-		// -----------------------
 		if cfg.Console {
 			useColor = detectColor()
 
@@ -66,38 +67,54 @@ func Init(cfg Config) error {
 				writer = &colorWriter{w: os.Stderr}
 			}
 
-			handlers = append(handlers,
-				slog.NewTextHandler(writer, opts),
-			)
+			if cfg.ConsoleJSON {
+				handlers = append(handlers,
+					slog.NewJSONHandler(writer, opts),
+				)
+			} else {
+				handlers = append(handlers,
+					slog.NewTextHandler(writer, opts),
+				)
+			}
 		}
 
-		// -----------------------
-		// File handler
-		// -----------------------
-		if cfg.FilePath != "" {
-			f, err := os.OpenFile(
-				cfg.FilePath,
-				os.O_CREATE|os.O_APPEND|os.O_WRONLY,
-				0644,
-			)
-			if err != nil {
-				initErr = err
-			} else {
-				if cfg.JSONFile {
-					handlers = append(handlers,
-						slog.NewJSONHandler(f, opts),
-					)
+		var fileWriter io.WriteCloser
+		if cfg.FileWriter != nil {
+			fileWriter = cfg.FileWriter
+		} else if cfg.FilePath != "" {
+			if cfg.FileMaxSizeBytes > 0 {
+				r, err := newFileRotator(cfg.FilePath, cfg.FileMaxSizeBytes, cfg.FileMaxBackups)
+				if err != nil {
+					initErr = err
 				} else {
-					handlers = append(handlers,
-						slog.NewTextHandler(f, opts),
-					)
+					fileWriter = r
+				}
+			} else {
+				f, err := os.OpenFile(
+					cfg.FilePath,
+					os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+					0o644,
+				)
+				if err != nil {
+					initErr = err
+				} else {
+					fileWriter = f
 				}
 			}
 		}
 
-		// -----------------------
-		// Fallback (never allow nil logger)
-		// -----------------------
+		if fileWriter != nil {
+			if cfg.JSONFile {
+				handlers = append(handlers,
+					slog.NewJSONHandler(fileWriter, opts),
+				)
+			} else {
+				handlers = append(handlers,
+					slog.NewTextHandler(fileWriter, opts),
+				)
+			}
+		}
+
 		if len(handlers) == 0 {
 			handlers = append(handlers,
 				slog.NewTextHandler(os.Stderr, opts),
@@ -111,13 +128,11 @@ func Init(cfg Config) error {
 			handler = newMultiHandler(handlers...)
 		}
 
-		// Decorator chain
 		handler = newStackHandler(handler, cfg.StacktraceLevel)
 		handler = newRedactionHandler(handler)
 
 		logger = slog.New(handler)
 		slog.SetDefault(logger)
-
 	})
 
 	return initErr
@@ -126,18 +141,18 @@ func Init(cfg Config) error {
 // Reset clears logger state.
 // Intended for testing only.
 func Reset() {
-	logger 			 = nil
-	useColor 		 = false
-	levelVar 		 = new(slog.LevelVar)
-	once 				 = sync.Once{}
+	logger = nil
+	useColor = false
+	levelVar = new(slog.LevelVar)
+	once = sync.Once{}
 	redactedKeys = map[string]struct{}{}
 }
 
 // SetLogger replaces the global logger.
 // Intended for testing only.
 func SetLogger(l *slog.Logger) {
-    logger = l
-    slog.SetDefault(l)
+	logger = l
+	slog.SetDefault(l)
 }
 
 func SetLevel(level slog.Level) {
@@ -153,12 +168,6 @@ func Logger() *slog.Logger {
 	}
 	return logger
 }
-
-//
-// ------------------------------------------------
-// Basic Logging
-// ------------------------------------------------
-//
 
 func Debug(msg string, args ...any) {
 	Logger().Debug(msg, args...)
@@ -208,13 +217,6 @@ func ErrorErr(msg string, err error, args ...any) {
 	Logger().Error(msg, fields...)
 }
 
-
-//
-// ------------------------------------------------
-// Context Logging
-// ------------------------------------------------
-//
-
 func DebugContext(ctx context.Context, msg string, args ...any) {
 	Logger().DebugContext(ctx, msg, args...)
 }
@@ -253,12 +255,6 @@ func ErrorErrContext(ctx context.Context, msg string, err error, args ...any) {
 	Logger().ErrorContext(ctx, msg, fields...)
 }
 
-//
-// ------------------------------------------------
-// Structured Helpers
-// ------------------------------------------------
-//
-
 func With(args ...any) *slog.Logger {
 	return Logger().With(args...)
 }
@@ -266,12 +262,6 @@ func With(args ...any) *slog.Logger {
 func WithGroup(name string) *slog.Logger {
 	return Logger().WithGroup(name)
 }
-
-//
-// ------------------------------------------------
-// Multi Handler
-// ------------------------------------------------
-//
 
 type multiHandler struct {
 	handlers []slog.Handler
@@ -291,10 +281,13 @@ func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	var firstErr error
 	for _, h := range m.handlers {
-		_ = h.Handle(ctx, r)
+		if err := h.Handle(ctx, r); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -313,12 +306,6 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 	return newMultiHandler(next...)
 }
 
-//
-// ------------------------------------------------
-// Timing Helpers
-// ------------------------------------------------
-//
-
 // Timed uses the default logger.
 func Timed(ctx context.Context, msg string, args ...any) func(extra ...any) {
 	return TimedLevel(Logger(), slog.LevelInfo, ctx, msg, args...)
@@ -327,8 +314,10 @@ func Timed(ctx context.Context, msg string, args ...any) func(extra ...any) {
 // TimedWith uses a provided logger (supports With(), WithGroup(), etc.)
 func TimedWith(l *slog.Logger, ctx context.Context, msg string, args ...any) func(extra ...any) {
 	start := time.Now()
+	startMsg := msg + " started"
+	doneMsg := msg + " completed"
 
-	l.InfoContext(ctx, msg+" started", args...)
+	l.InfoContext(ctx, startMsg, args...)
 
 	return func(extra ...any) {
 		duration := time.Since(start)
@@ -338,7 +327,7 @@ func TimedWith(l *slog.Logger, ctx context.Context, msg string, args ...any) fun
 		fields = append(fields, extra...)
 		fields = append(fields, "duration", duration)
 
-		l.InfoContext(ctx, msg+" completed", fields...)
+		l.InfoContext(ctx, doneMsg, fields...)
 	}
 }
 
@@ -349,10 +338,11 @@ func TimedLevel(
 	msg string,
 	args ...any,
 ) func(extra ...any) {
-
 	start := time.Now()
+	startMsg := msg + " started"
+	doneMsg := msg + " completed"
 
-	l.Log(ctx, level, msg+" started", args...)
+	l.Log(ctx, level, startMsg, args...)
 
 	return func(extra ...any) {
 		duration := time.Since(start)
@@ -362,41 +352,47 @@ func TimedLevel(
 		fields = append(fields, extra...)
 		fields = append(fields, "duration", duration)
 
-		l.Log(ctx, level, msg+" completed", fields...)
+		l.Log(ctx, level, doneMsg, fields...)
 	}
 }
-
-
-//
-// ------------------------------------------------
-// Color Support
-// ------------------------------------------------
-//
 
 type colorWriter struct {
 	w io.Writer
 }
 
 func (cw *colorWriter) Write(p []byte) (int, error) {
-	line := string(p)
+	var (
+		levelTag []byte
+		colored  []byte
+	)
 
-	// Fast prefix detection (TextHandler format always has level=XXX)
 	switch {
-	case strings.Contains(line, "level=ERROR"):
-		line = strings.Replace(line, "level=ERROR",
-			colorRed+"level=ERROR"+colorReset, 1)
-	case strings.Contains(line, "level=WARN"):
-		line = strings.Replace(line, "level=WARN",
-			colorYellow+"level=WARN"+colorReset, 1)
-	case strings.Contains(line, "level=INFO"):
-		line = strings.Replace(line, "level=INFO",
-			colorGreen+"level=INFO"+colorReset, 1)
-	case strings.Contains(line, "level=DEBUG"):
-		line = strings.Replace(line, "level=DEBUG",
-			colorGray+"level=DEBUG"+colorReset, 1)
+	case bytes.Contains(p, []byte("level=ERROR")):
+		levelTag = []byte("level=ERROR")
+		colored = []byte(colorRed + "level=ERROR" + colorReset)
+	case bytes.Contains(p, []byte("level=WARN")):
+		levelTag = []byte("level=WARN")
+		colored = []byte(colorYellow + "level=WARN" + colorReset)
+	case bytes.Contains(p, []byte("level=INFO")):
+		levelTag = []byte("level=INFO")
+		colored = []byte(colorGreen + "level=INFO" + colorReset)
+	case bytes.Contains(p, []byte("level=DEBUG")):
+		levelTag = []byte("level=DEBUG")
+		colored = []byte(colorGray + "level=DEBUG" + colorReset)
+	default:
+		return cw.w.Write(p)
 	}
 
-	return cw.w.Write([]byte(line))
+	i := bytes.Index(p, levelTag)
+	if i < 0 {
+		return cw.w.Write(p)
+	}
+
+	out := make([]byte, 0, len(p)+len(colored)-len(levelTag))
+	out = append(out, p[:i]...)
+	out = append(out, colored...)
+	out = append(out, p[i+len(levelTag):]...)
+	return cw.w.Write(out)
 }
 
 func detectColor() bool {

@@ -11,24 +11,55 @@ import (
 	"github.com/rannday/logx"
 )
 
+// HTTPMiddleware returns an http.Handler that instruments requests with timing,
+// status-level mapping, panic recovery, and a request-scoped logger stored
+// in the request context (accessible via logx.LoggerFromContext).
 func HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
+		// populate request-scoped logger and ensure a request id
+		ctx := r.Context()
+		var reqID string
+		if id, ok := logx.RequestID(ctx); ok {
+			reqID = id
+		} else if id := r.Header.Get("X-Request-ID"); id != "" {
+			reqID = id
+		} else {
+			reqID = logx.NewRequestID()
+		}
+		ctx = logx.WithRequestID(ctx, reqID)
+
+		// build per-request logger with useful fields
+		l := logx.Logger().With(
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+			"method", r.Method,
+			"url", logx.SanitizeURL(r.URL),
+		)
+		if id, ok := logx.RequestID(ctx); ok {
+			l = l.With("request_id", id)
+		}
+
+		ctx = logx.WithLogger(ctx, l)
+		// update request with new context
+		r = r.WithContext(ctx)
+
+		// expose request id to clients
 		rw := &responseWriter{
 			ResponseWriter: w,
 			status:         200,
 		}
+		rw.Header().Set("X-Request-ID", reqID)
 
 		defer func() {
 			if rec := recover(); rec != nil {
 				rw.status = http.StatusInternalServerError
 
-				logx.Logger().ErrorContext(
+				// use request-scoped logger if present
+				logx.LoggerFromContext(r.Context()).ErrorContext(
 					r.Context(),
 					"http handler panic",
-					"method", r.Method,
-					"path", r.URL.Path,
 					"panic", rec,
 					"stack", string(debug.Stack()),
 				)
@@ -40,7 +71,7 @@ func HTTPMiddleware(next http.Handler) http.Handler {
 
 			fields := []any{
 				"method", r.Method,
-				"path", r.URL.Path,
+				"url", logx.SanitizeURL(r.URL),
 				"status", rw.status,
 				"duration", duration,
 				"remote_addr", r.RemoteAddr,
@@ -60,7 +91,8 @@ func HTTPMiddleware(next http.Handler) http.Handler {
 				level = slog.LevelWarn
 			}
 
-			logx.Logger().Log(r.Context(), level,
+			// use request-scoped logger
+			logx.LoggerFromContext(r.Context()).Log(r.Context(), level,
 				"http request completed",
 				fields...,
 			)
@@ -110,5 +142,5 @@ func (rw *responseWriter) Push(target string, opts *http.PushOptions) error {
 }
 
 func (rw *responseWriter) Unwrap() http.ResponseWriter {
-    return rw.ResponseWriter
+	return rw.ResponseWriter
 }

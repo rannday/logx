@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 func SanitizeURL(u *url.URL) string {
@@ -27,12 +29,46 @@ func SanitizeURL(u *url.URL) string {
 	return clone.String()
 }
 
-var redactedKeys = map[string]struct{}{}
+var (
+	redactedKeys         = map[string]struct{}{}
+	redactedKeysMu       sync.RWMutex
+	redactedKeysSnapshot atomic.Value // map[string]struct{}
+)
+
+func init() {
+	redactedKeysSnapshot.Store(map[string]struct{}{})
+}
 
 func SetRedactedKeys(keys ...string) {
+	redactedKeysMu.Lock()
+	defer redactedKeysMu.Unlock()
 	for _, k := range keys {
 		redactedKeys[strings.ToLower(k)] = struct{}{}
 	}
+	redactedKeysSnapshot.Store(cloneKeySet(redactedKeys))
+}
+
+// AddRedactedKeys appends keys to the redaction set (concurrency-safe).
+func AddRedactedKeys(keys ...string) {
+	SetRedactedKeys(keys...)
+}
+
+// ClearRedactedKeys removes all configured redacted keys.
+func ClearRedactedKeys() {
+	redactedKeysMu.Lock()
+	defer redactedKeysMu.Unlock()
+	redactedKeys = map[string]struct{}{}
+	redactedKeysSnapshot.Store(map[string]struct{}{})
+}
+
+// ListRedactedKeys returns a snapshot of configured redacted keys.
+func ListRedactedKeys() []string {
+	keys, _ := redactedKeysSnapshot.Load().(map[string]struct{})
+	out := make([]string, 0, len(keys))
+	for k := range keys {
+		out = append(out, k)
+	}
+	return out
 }
 
 type redactionHandler struct {
@@ -48,7 +84,8 @@ func (h *redactionHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *redactionHandler) Handle(ctx context.Context, r slog.Record) error {
-	if len(redactedKeys) == 0 {
+	keys, _ := redactedKeysSnapshot.Load().(map[string]struct{})
+	if len(keys) == 0 {
 		return h.next.Handle(ctx, r)
 	}
 
@@ -57,14 +94,14 @@ func (h *redactionHandler) Handle(ctx context.Context, r slog.Record) error {
 	var attrs []slog.Attr
 
 	nr.Attrs(func(a slog.Attr) bool {
-		if _, ok := redactedKeys[strings.ToLower(a.Key)]; ok {
+		_, ok := keys[strings.ToLower(a.Key)]
+		if ok {
 			a.Value = slog.StringValue("REDACTED")
 		}
 		attrs = append(attrs, a)
 		return true
 	})
 
-	// Rebuild record while preserving metadata
 	newRec := slog.NewRecord(
 		nr.Time,
 		nr.Level,
@@ -83,4 +120,12 @@ func (h *redactionHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *redactionHandler) WithGroup(name string) slog.Handler {
 	return newRedactionHandler(h.next.WithGroup(name))
+}
+
+func cloneKeySet(src map[string]struct{}) map[string]struct{} {
+	dst := make(map[string]struct{}, len(src))
+	for k := range src {
+		dst[k] = struct{}{}
+	}
+	return dst
 }
